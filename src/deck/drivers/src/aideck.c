@@ -46,9 +46,102 @@
 #include "system.h"
 #include "uart1.h"
 #include "uart2.h"
+#include "static_mem.h"
+
+#define NINALINK_MAGIC "\xbc\xa1"
+#define NINALINK_MTU 128
 
 static bool isInit = false;
 static uint8_t byte;
+
+typedef enum
+{
+  waitForFirstStart,
+  waitForSecondStart,
+  waitForType,
+  waitForLength,
+  waitForData,
+  waitForChksum1,
+  waitForChksum2
+} NinalinkRxState;
+
+typedef struct {
+  uint8_t type;
+  uint8_t length;
+
+  uint8_t data[NINALINK_MTU];
+} __attribute__((packed)) NinalinkPacket;
+
+static volatile NinalinkPacket nlp = { 0, };
+static volatile NinalinkRxState ninalinkRxState = waitForFirstStart;
+static volatile uint8_t dataIndex = 0;
+static volatile uint8_t cksum[2] = { 0, };
+
+static xQueueHandle ninalinkPacketDelivery;
+STATIC_MEM_QUEUE_ALLOC(ninalinkPacketDelivery, 8, sizeof(NinalinkPacket));
+
+void ninalink_receive(uint8_t c)
+{
+    switch (ninalinkRxState) {
+    case waitForFirstStart:
+        ninalinkRxState = (c == NINALINK_MAGIC[0]) ? waitForSecondStart : waitForFirstStart;
+        break;
+    case waitForSecondStart:
+        ninalinkRxState = (c == NINALINK_MAGIC[1]) ? waitForType : waitForFirstStart;
+    break;
+    case waitForType:
+        cksum[0] = c;
+        cksum[1] = c;
+        nlp.type = c;
+        ninalinkRxState = waitForLength;
+        break;
+    case waitForLength:
+        if (c <= NINALINK_MTU) {
+        nlp.length = c;
+        cksum[0] += c;
+        cksum[1] += cksum[0];
+        dataIndex = 0;
+        ninalinkRxState = (c > 0) ? waitForData : waitForChksum1;
+        } else {
+            ninalinkRxState = waitForFirstStart;
+        }
+        break;
+    case waitForData:
+        nlp.data[dataIndex] = c;
+        cksum[0] += c;
+        cksum[1] += cksum[0];
+        dataIndex++;
+        if (dataIndex == nlp.length) {
+            ninalinkRxState = waitForChksum1;
+        }
+        break;
+    case waitForChksum1:
+        if (cksum[0] == c) {
+            ninalinkRxState = waitForChksum2;
+        } else {
+            ninalinkRxState = waitForFirstStart; //Checksum error
+        }
+        break;
+    case waitForChksum2:
+        if (cksum[1] == c) {
+        // Post the packet to the queue if there's room
+            if (!xQueueIsQueueFullFromISR(ninalinkPacketDelivery)) {
+            xQueueSend(ninalinkPacketDelivery, (void *)&nlp, 0);
+            } else {
+            // Only assert if debugger is not connected
+            ASSERT(0); // Queue overflow
+            }
+        } else {
+              ninalinkRxState = waitForFirstStart; //Checksum error
+            ASSERT(0);
+        }
+        ninalinkRxState = waitForFirstStart;
+        break;
+    default:
+        ASSERT(0);
+        break;
+    }
+  }
 
 //Uncomment when NINA printout read is desired from console
 //#define DEBUG_NINA_PRINT
@@ -111,14 +204,8 @@ static void aideckInit(DeckInfo *info)
     xTaskCreate(Gap8Task, AI_DECK_GAP_TASK_NAME, AI_DECK_TASK_STACKSIZE, NULL,
                 AI_DECK_TASK_PRI, NULL);
 
-#ifdef DEBUG_NINA_PRINT
-    // Initialize the UART for the NINA
-    uart2Init(115200);
-    // Initialize task for the NINA
-    xTaskCreate(NinaTask, AI_DECK_NINA_TASK_NAME, AI_DECK_TASK_STACKSIZE, NULL,
-                AI_DECK_TASK_PRI, NULL);
+    ninalinkPacketDelivery = STATIC_MEM_QUEUE_CREATE(ninalinkPacketDelivery);
 
-#endif
 
     isInit = true;
 }
